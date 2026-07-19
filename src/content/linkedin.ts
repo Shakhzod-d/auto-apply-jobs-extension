@@ -57,6 +57,22 @@ async function waitFor(
   return predicate();
 }
 
+// LinkedIn can leave a previous modal's DOM node behind (hidden, not
+// removed) after it closes. document.querySelector always returns the
+// *first* match regardless of visibility, so once a stale one exists,
+// every later query for "the modal" could silently grab the dead one
+// instead of the real, currently-open one -- extraction and button-finding
+// would then search a subtree that will never contain what they're looking
+// for. Filter to elements that actually have layout (offsetParent is null
+// for display:none and detached nodes).
+function getVisibleModal(): Element | null {
+  const candidates = document.querySelectorAll(SELECTORS.modal);
+  for (const el of Array.from(candidates)) {
+    if ((el as HTMLElement).offsetParent !== null) return el;
+  }
+  return null;
+}
+
 function isEasyApplyModal(modal: Element): boolean {
   return (
     !!modal.querySelector(SELECTORS.formFieldWrapper) ||
@@ -261,7 +277,7 @@ async function runEasyApplyFlow(
     // findStageButton() below would report "no button found" on essentially
     // every step past the first -- this was a real, confirmed bug (a live
     // bulk run reported 284 processed / 0 submitted / 284 failed).
-    const modal = document.querySelector(SELECTORS.modal) ?? initialModal;
+    const modal = getVisibleModal() ?? initialModal;
 
     await handleResumeStep(modal, sync.profile.resumeFileUrl);
 
@@ -323,7 +339,7 @@ async function runEasyApplyFlow(
   return failApplication(
     application,
     `Exceeded ${MAX_STEPS} steps without reaching submit -- form is probably longer/different than expected`,
-    document.querySelector(SELECTORS.modal) ?? initialModal,
+    getVisibleModal() ?? initialModal,
   );
 }
 
@@ -411,9 +427,13 @@ async function onEasyApplyModalOpened(modal: Element) {
     }
     const application = appRes.data;
 
-    // Already handled before (submitted, or already sitting in the pending
-    // queue from a previous pass) -- don't reprocess.
-    if (application.status === "submitted" || application.status === "blocked_needs_answer") {
+    // Only a genuine terminal state skips reprocessing. blocked_needs_answer
+    // does NOT -- if it did, answering the question from the dashboard would
+    // have no effect, since nothing else ever revisits that application.
+    // Retrying re-runs field matching, which now picks up whatever the user
+    // answered; any field still genuinely unanswered gets re-reported but
+    // deduped dashboard-side rather than piling up duplicates.
+    if (application.status === "submitted") {
       resolveBulk?.("blocked");
       return;
     }
@@ -429,7 +449,7 @@ async function onEasyApplyModalOpened(modal: Element) {
 const seenModals = new WeakSet<Element>();
 
 const observer = new MutationObserver(() => {
-  const modal = document.querySelector(SELECTORS.modal);
+  const modal = getVisibleModal();
   if (modal && isEasyApplyModal(modal) && !seenModals.has(modal)) {
     seenModals.add(modal);
     onEasyApplyModalOpened(modal).catch((err) => {
@@ -480,8 +500,11 @@ async function stopBulkRun(reason: string) {
   if (current) await setBulkRunState({ ...current, active: false, lastMessage: reason });
 }
 
+const MAX_CONSECUTIVE_FAILURES = 3;
+
 async function bulkApplyLoop() {
   const processedJobIds = new Set<string>();
+  let consecutiveFailures = 0;
   log("bulk apply loop started");
 
   while (true) {
@@ -583,6 +606,24 @@ async function bulkApplyLoop() {
         lastActivityAt: Date.now(),
         lastMessage: `${cardTitle}: ${result}`,
       });
+
+      // Circuit breaker: a real incident (284 consecutive failures, then 492
+      // more on a retry) almost certainly tripped LinkedIn's own abuse
+      // detection well before either of those runs stopped on their own --
+      // "no more results" was the only thing that ever ended it. Failing
+      // repeatedly in a row means something is systemically broken (a
+      // selector mismatch, a detection bug, LinkedIn pushing back), and
+      // grinding through hundreds more attempts only makes that worse.
+      if (result === "failed") {
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          return stopBulkRun(
+            `Stopped after ${consecutiveFailures} failures in a row -- check the dashboard/console before retrying`,
+          );
+        }
+      } else {
+        consecutiveFailures = 0;
+      }
 
       // Easy Apply's "pending review" happens in *this* tab's modal, left
       // open on purpose -- stop the loop rather than barreling into the next
