@@ -16,6 +16,7 @@ import {
 } from "../lib/autofill-engine";
 import { fillFileInput, labelTextFor } from "../lib/dom-fill";
 import { sendMessage, type ExtensionMessage } from "../lib/messages";
+import { SEARCH_URLS } from "../lib/search-urls";
 import type { Application, FieldType, FlowResult, SyncPayload } from "../lib/types";
 import {
   getBulkRunState,
@@ -503,7 +504,6 @@ async function stopBulkRun(reason: string) {
 const MAX_CONSECUTIVE_FAILURES = 3;
 
 async function bulkApplyLoop() {
-  const processedJobIds = new Set<string>();
   let consecutiveFailures = 0;
   log("bulk apply loop started");
 
@@ -525,6 +525,20 @@ async function bulkApplyLoop() {
         return stopBulkRun("LinkedIn daily cap reached");
       }
 
+      // LinkedIn can navigate the tab away from the search results after a
+      // submission (observed: /jobs/search/post-apply/next-best-action/...).
+      // Card iteration only makes sense on the actual results page -- steer
+      // back to it rather than trying to interpret whatever LinkedIn showed
+      // instead.
+      if (!location.pathname.startsWith("/jobs/search")) {
+        await reportStatus("Navigating back to search results…");
+        location.href = SEARCH_URLS.linkedin(sync.settings.searchKeywords);
+        return; // this navigation reinjects the content script; maybeStartBulkRun() picks the loop back up
+      }
+
+      // Defensive fallback for a run started before this field existed.
+      const processedJobIds = new Set(bulkRun.processedJobIds ?? []);
+
       await reportStatus("Looking for the next job…");
       await waitFor(() => getJobCards().length > 0);
       const cards = getJobCards();
@@ -545,7 +559,7 @@ async function bulkApplyLoop() {
       }
 
       const jobId = cardJobId(next)!;
-      processedJobIds.add(jobId);
+      await setBulkRunState({ ...bulkRun, processedJobIds: [...(bulkRun.processedJobIds ?? []), jobId] });
       const cardTitle = next.querySelector('a[href*="/jobs/view/"]')?.textContent?.trim() ?? jobId;
 
       await reportStatus(`Opening: ${cardTitle}`);

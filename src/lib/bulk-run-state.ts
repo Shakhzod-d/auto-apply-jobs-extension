@@ -17,6 +17,18 @@ export interface BulkRunState {
   pendingExternalTabId?: number;
   /** Set by the driver just before clicking an external "Apply" button, since the new tab itself can't know this. */
   pendingExternalJobInfo?: { jobTitle: string; company: string; url: string };
+  /**
+   * Job IDs already attempted this run. Persisted here rather than kept as a
+   * local Set inside the loop, because LinkedIn can navigate the tab to a
+   * genuinely different URL after a submission (observed:
+   * /jobs/search/post-apply/next-best-action/...) -- a real navigation
+   * reinjects the content script from scratch, and an in-memory Set doesn't
+   * survive that. Losing it meant the loop forgot it had already tried the
+   * top-of-list job and picked the exact same one again, every time,
+   * indefinitely -- confirmed live: 50 "processed" against a single
+   * database row.
+   */
+  processedJobIds: string[];
 }
 
 const STORAGE_KEY = "bulkRun";
@@ -42,5 +54,6 @@ export function newBulkRunState(platform: Platform): BulkRunState {
     blockedCount: 0,
     failedCount: 0,
     lastActivityAt: now,
+    processedJobIds: [],
   };
 }

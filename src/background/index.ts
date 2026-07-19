@@ -1,6 +1,7 @@
 import { getDashboardConfig } from "../lib/dashboard-config";
 import { getBulkRunState, newBulkRunState, setBulkRunState } from "../lib/bulk-run-state";
 import type { ExtensionMessage, ExtensionResponse, ConnectionStatus } from "../lib/messages";
+import { SEARCH_URLS } from "../lib/search-urls";
 import type { SyncPayload } from "../lib/types";
 import {
   fetchSyncPayload,
@@ -9,13 +10,6 @@ import {
   updateApplicationStatus,
   updateSettingsRemote,
 } from "./dashboard-api";
-
-const SEARCH_URLS = {
-  linkedin: (keywords: string) =>
-    `https://www.linkedin.com/jobs/search/?${new URLSearchParams({ keywords, f_AL: "true" }).toString()}`,
-  indeed: (keywords: string) =>
-    `https://www.indeed.com/jobs?${new URLSearchParams({ q: keywords }).toString()}`,
-} as const;
 
 async function openOrNavigateTab(url: string, hostMatch: string): Promise<number> {
   const tabs = await chrome.tabs.query({ url: `*://*.${hostMatch}/*` });
