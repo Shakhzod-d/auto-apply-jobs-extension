@@ -1,4 +1,11 @@
-import type { Application, ApplicationStatus, FieldType, Platform, SyncPayload } from "./types";
+import type {
+  Application,
+  ApplicationStatus,
+  FieldType,
+  Platform,
+  SubmitMode,
+  SyncPayload,
+} from "./types";
 
 export type ExtensionMessage =
   | { type: "TEST_CONNECTION"; dashboardUrl: string; apiToken: string }
@@ -24,7 +31,11 @@ export type ExtensionMessage =
       questionText: string;
       fieldType: FieldType;
       options?: string[];
-    };
+    }
+  | { type: "START_BULK_APPLY"; platform: Platform }
+  | { type: "STOP_BULK_APPLY" }
+  | { type: "GET_BULK_RUN_STATE" }
+  | { type: "UPDATE_SETTINGS"; submitMode?: SubmitMode };
 
 export type ExtensionResponse<T = unknown> =
   | { ok: true; data: T }

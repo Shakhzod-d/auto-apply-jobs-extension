@@ -1,11 +1,12 @@
 // LinkedIn Easy Apply content script.
 //
-// Selectors below were captured by hand-inspecting a real Easy Apply modal
-// (2026-07-19) -- LinkedIn's own CSS classes are build-hashed and unstable,
-// but these `data-*`/`data-test-*` attributes and native `<label for>`
-// associations held steady across the whole flow and are the intended hooks
-// for this kind of tooling. They *will* need occasional maintenance as
-// LinkedIn changes its markup -- that's expected, not a bug to chase forever.
+// Selectors below were captured by hand-inspecting real Easy Apply flows and
+// search results (2026-07-19) -- LinkedIn's own CSS classes are
+// build-hashed and unstable, but these `data-*`/`data-test-*` attributes,
+// native `<label for>` associations, and aria-labels held steady throughout
+// and are the intended hooks for this kind of tooling. They *will* need
+// occasional maintenance as LinkedIn changes its markup -- expected, not a
+// bug to chase forever.
 import {
   fillField,
   matchAndFillFields,
@@ -16,6 +17,11 @@ import {
 import { fillFileInput, labelTextFor } from "../lib/dom-fill";
 import { sendMessage } from "../lib/messages";
 import type { Application, FieldType, SyncPayload } from "../lib/types";
+import {
+  getBulkRunState,
+  setBulkRunState,
+  type BulkRunState,
+} from "../lib/bulk-run-state";
 
 const SELECTORS = {
   modal: ".artdeco-modal",
@@ -26,6 +32,8 @@ const SELECTORS = {
   jobTitle: ".job-details-jobs-unified-top-card__job-title",
   companyName: ".job-details-jobs-unified-top-card__company-name",
   jobIdHolder: "[data-job-id]",
+  jobCard: "li[data-occludable-job-id]",
+  nextPageButton: 'button[aria-label="View next page"]',
 } as const;
 
 function sleep(ms: number) {
@@ -39,18 +47,26 @@ function isEasyApplyModal(modal: Element): boolean {
   );
 }
 
-// Closes the modal and discards the in-progress draft (the "Discard" choice
-// in LinkedIn's "Save this application?" confirmation) -- used on our own
-// error paths so a stuck/unrecognized form doesn't block the rest of a bulk
-// run stuck behind an open modal.
-async function closeAndDiscardModal(modal: Element) {
+async function clickAndWait(el: HTMLElement, ms = 500) {
+  el.click();
+  await sleep(ms);
+}
+
+// Closes the modal via the "Save this application?" confirmation.
+// `keepDraft: true` clicks Save (LinkedIn remembers it under My Jobs > In
+// Progress, so a later pass can pick it back up) -- used when a bulk run
+// abandons an application because it hit an unanswered required question,
+// so we don't lose the fields already filled. `keepDraft: false` clicks
+// Discard -- used on genuine errors where resuming wouldn't help.
+async function closeModal(modal: Element, keepDraft: boolean) {
   const closeButton = modal.querySelector<HTMLElement>("[data-test-modal-close-btn]");
-  closeButton?.click();
+  if (!closeButton) return;
+  await clickAndWait(closeButton);
+
+  const buttons = Array.from(document.querySelectorAll("button"));
+  const target = buttons.find((b) => b.textContent?.trim() === (keepDraft ? "Save" : "Discard"));
+  target?.click();
   await sleep(500);
-  const discardButton = Array.from(document.querySelectorAll("button")).find(
-    (b) => b.textContent?.trim() === "Discard",
-  );
-  discardButton?.click();
 }
 
 function getCurrentJobInfo(): { jobTitle: string; company: string; url: string } | null {
@@ -62,15 +78,15 @@ function getCurrentJobInfo(): { jobTitle: string; company: string; url: string }
   const company = companyEl?.textContent?.trim();
   if (!jobTitle || !company || !jobId) return null;
 
-  return {
-    jobTitle,
-    company,
-    // Canonical URL keyed on the numeric job ID -- the visible location.href
-    // while browsing search results includes volatile query params
-    // (currentJobId, search keywords) that would defeat the dashboard's
-    // dedupe-by-url logic.
-    url: `https://www.linkedin.com/jobs/view/${jobId}/`,
-  };
+  return { jobTitle, company, url: jobUrlFromId(jobId) };
+}
+
+function jobUrlFromId(jobId: string): string {
+  // Canonical URL keyed on the numeric job ID -- the visible location.href
+  // while browsing search results includes volatile query params
+  // (currentJobId, tracking IDs) that would defeat the dashboard's
+  // dedupe-by-url logic.
+  return `https://www.linkedin.com/jobs/view/${jobId}/`;
 }
 
 // One row of the form (a single question) can be a text input, a
@@ -156,7 +172,7 @@ function findStageButton(
 async function reportUnmatchedField(
   application: Application,
   field: ExtractedField,
-): Promise<string | null> {
+): Promise<void> {
   const options =
     field.fieldType === "select"
       ? Array.from((field.element as HTMLSelectElement).options).map((o) => o.textContent?.trim() ?? "")
@@ -171,21 +187,39 @@ async function reportUnmatchedField(
     fieldType: field.fieldType as FieldType,
     options,
   });
-
-  return waitForAnswer(field.label);
 }
 
-async function failApplication(application: Application, reason: string, modal: Element) {
+type FlowResult = "submitted" | "pending_review" | "blocked" | "failed";
+
+async function failApplication(
+  application: Application,
+  reason: string,
+  modal: Element,
+): Promise<FlowResult> {
   await sendMessage({
     type: "UPDATE_APPLICATION_STATUS",
     applicationId: application.id,
     status: "failed",
     failureReason: reason,
   });
-  await closeAndDiscardModal(modal);
+  await closeModal(modal, false);
+  return "failed";
 }
 
-async function runEasyApplyFlow(modal: Element, application: Application, sync: SyncPayload) {
+// `interactive: true` (a human just clicked Easy Apply themselves) blocks on
+// each unanswered required question, waiting for the user to answer it from
+// the dashboard, since they're right there expecting the form to complete.
+// `interactive: false` (the bulk driver opened this) never blocks -- it
+// reports the question, saves the draft, and moves on immediately, since
+// blocking a 1000-job run for up to 30 minutes per unknown question would
+// defeat the purpose. That application stays `blocked_needs_answer` for a
+// human (or a future resume pass) to pick up later.
+async function runEasyApplyFlow(
+  modal: Element,
+  application: Application,
+  sync: SyncPayload,
+  interactive: boolean,
+): Promise<FlowResult> {
   const MAX_STEPS = 25;
 
   for (let step = 0; step < MAX_STEPS; step++) {
@@ -195,27 +229,32 @@ async function runEasyApplyFlow(modal: Element, application: Application, sync: 
     const { unmatched } = matchAndFillFields(fields, sync.profile, sync.questionBank);
     const requiredUnmatched = unmatched.filter(isFieldRequired);
 
+    if (requiredUnmatched.length > 0 && !interactive) {
+      for (const field of requiredUnmatched) await reportUnmatchedField(application, field);
+      await closeModal(modal, true);
+      return "blocked";
+    }
+
     for (const field of requiredUnmatched) {
-      const answer = await reportUnmatchedField(application, field);
+      await reportUnmatchedField(application, field);
+      const answer = await waitForAnswer(field.label);
       if (!answer) {
-        await failApplication(
+        return failApplication(
           application,
           `Timed out waiting for an answer to: "${field.label}"`,
           modal,
         );
-        return;
       }
       fillField(field, answer);
     }
 
     const button = findStageButton(modal);
     if (!button) {
-      await failApplication(
+      return failApplication(
         application,
         "Could not find a Next/Review/Submit button on the current step",
         modal,
       );
-      return;
     }
 
     if (button.kind === "submit") {
@@ -225,27 +264,39 @@ async function runEasyApplyFlow(modal: Element, application: Application, sync: 
           applicationId: application.id,
           status: "filled_pending_review",
         });
-      } else {
-        button.el.click();
-        await sendMessage({
-          type: "UPDATE_APPLICATION_STATUS",
-          applicationId: application.id,
-          status: "submitted",
-          submittedAt: new Date().toISOString(),
-        });
+        return "pending_review";
       }
-      return;
+      button.el.click();
+      await sendMessage({
+        type: "UPDATE_APPLICATION_STATUS",
+        applicationId: application.id,
+        status: "submitted",
+        submittedAt: new Date().toISOString(),
+      });
+      return "submitted";
     }
 
     button.el.click();
     await sleep(randomDelayMs(2, 4));
   }
 
-  await failApplication(
+  return failApplication(
     application,
     `Exceeded ${MAX_STEPS} steps without reaching submit -- form is probably longer/different than expected`,
     modal,
   );
+}
+
+// The observer below fires for *every* Easy Apply modal, whether a human or
+// the bulk driver opened it. When the driver is waiting on one, it stashes
+// its resolver here so the observer's result flows back to it; otherwise
+// the observer treats the open as an interactive, user-initiated one.
+let pendingBulkResolve: ((result: FlowResult) => void) | null = null;
+
+function waitForNextModalResult(): Promise<FlowResult> {
+  return new Promise((resolve) => {
+    pendingBulkResolve = resolve;
+  });
 }
 
 async function onEasyApplyModalOpened(modal: Element) {
@@ -270,9 +321,18 @@ async function onEasyApplyModalOpened(modal: Element) {
 
   // Already handled before (submitted, or already sitting in the pending
   // queue from a previous pass) -- don't reprocess.
-  if (application.status === "submitted" || application.status === "blocked_needs_answer") return;
+  if (application.status === "submitted" || application.status === "blocked_needs_answer") {
+    pendingBulkResolve?.("blocked");
+    pendingBulkResolve = null;
+    return;
+  }
 
-  await runEasyApplyFlow(modal, application, sync);
+  const resolveBulk = pendingBulkResolve;
+  pendingBulkResolve = null;
+  const interactive = !resolveBulk;
+
+  const result = await runEasyApplyFlow(modal, application, sync, interactive);
+  resolveBulk?.(result);
 }
 
 const seenModals = new WeakSet<Element>();
@@ -283,10 +343,147 @@ const observer = new MutationObserver(() => {
     seenModals.add(modal);
     onEasyApplyModalOpened(modal).catch((err) => {
       console.error("[auto-apply-jobs] linkedin flow failed", err);
+      pendingBulkResolve?.("failed");
+      pendingBulkResolve = null;
     });
   }
 });
 
 observer.observe(document.body, { childList: true, subtree: true });
+
+// ---------------------------------------------------------------------------
+// Bulk-apply driver: works through the current search results page, clicking
+// Easy Apply on each not-yet-applied listing and letting the flow above
+// handle the resulting modal.
+
+function getJobCards(): HTMLElement[] {
+  return Array.from(document.querySelectorAll<HTMLElement>(SELECTORS.jobCard));
+}
+
+function cardJobId(card: HTMLElement): string | null {
+  return card.querySelector("[data-job-id]")?.getAttribute("data-job-id") ?? null;
+}
+
+function cardIsEasyApply(card: HTMLElement): boolean {
+  return /Easy Apply/i.test(card.textContent ?? "");
+}
+
+function cardAlreadyApplied(card: HTMLElement): boolean {
+  return /\bApplied\b/.test(card.textContent ?? "");
+}
+
+async function goToNextPage(): Promise<boolean> {
+  const nextButton = document.querySelector<HTMLButtonElement>(SELECTORS.nextPageButton);
+  if (!nextButton || nextButton.disabled) return false;
+  await clickAndWait(nextButton, 2000);
+  return true;
+}
+
+async function bulkApplyLoop() {
+  const processedJobIds = new Set<string>();
+
+  while (true) {
+    const bulkRun = await getBulkRunState();
+    if (!bulkRun?.active || bulkRun.platform !== "linkedin") return;
+
+    const syncRes = await sendMessage<SyncPayload>({ type: "GET_SYNC_DATA", forceRefresh: true });
+    if (!syncRes.ok) {
+      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "Lost connection to dashboard" });
+      return;
+    }
+    const sync = syncRes.data;
+
+    if (!sync.settings.linkedinEnabled) {
+      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "LinkedIn disabled in Settings" });
+      return;
+    }
+    if (sync.stats.appliedToday >= sync.settings.dailyCap) {
+      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "Overall daily cap reached" });
+      return;
+    }
+    if (sync.stats.linkedinAppliedToday >= sync.settings.linkedinDailyCap) {
+      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "LinkedIn daily cap reached" });
+      return;
+    }
+
+    const cards = getJobCards();
+    const next = cards.find((card) => {
+      const jobId = cardJobId(card);
+      return jobId && !processedJobIds.has(jobId) && cardIsEasyApply(card) && !cardAlreadyApplied(card);
+    });
+
+    if (!next) {
+      const advanced = await goToNextPage();
+      if (!advanced) {
+        await setBulkRunState({ ...bulkRun, active: false, lastMessage: "No more results" });
+        return;
+      }
+      continue;
+    }
+
+    const jobId = cardJobId(next)!;
+    processedJobIds.add(jobId);
+
+    next.scrollIntoView({ block: "center" });
+    await clickAndWait(next, 1500);
+
+    const applyButton = document.querySelector<HTMLElement>(
+      '.jobs-apply-button[data-live-test-job-apply-button], .jobs-apply-button',
+    );
+    if (!applyButton) {
+      continue; // details pane didn't load an apply button in time -- skip this one
+    }
+
+    const resultPromise = waitForNextModalResult();
+    applyButton.click();
+
+    const result = await Promise.race([
+      resultPromise,
+      sleep(3 * 60_000).then((): FlowResult => "failed"), // safety timeout per job
+    ]);
+
+    const updated = await getBulkRunState();
+    if (!updated) return;
+    await setBulkRunState({
+      ...updated,
+      processedCount: updated.processedCount + 1,
+      submittedCount: updated.submittedCount + (result === "submitted" ? 1 : 0),
+      pendingReviewCount: updated.pendingReviewCount + (result === "pending_review" ? 1 : 0),
+      blockedCount: updated.blockedCount + (result === "blocked" ? 1 : 0),
+      failedCount: updated.failedCount + (result === "failed" ? 1 : 0),
+      lastActivityAt: Date.now(),
+    });
+
+    // In review mode, a submitted-for-review application leaves the modal
+    // open for the user -- stop the automated loop rather than barreling
+    // into the next job out from under them.
+    if (result === "pending_review") {
+      await setBulkRunState({
+        ...(await getBulkRunState())!,
+        active: false,
+        lastMessage: "Filled and waiting for your review",
+      });
+      return;
+    }
+
+    await sleep(randomDelayMs(sync.settings.minDelaySeconds, sync.settings.maxDelaySeconds));
+  }
+}
+
+async function maybeStartBulkRun() {
+  const bulkRun = await getBulkRunState();
+  if (bulkRun?.active && bulkRun.platform === "linkedin") {
+    bulkApplyLoop().catch((err) => console.error("[auto-apply-jobs] bulk apply loop failed", err));
+  }
+}
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  const newValue = changes.bulkRun?.newValue as BulkRunState | undefined;
+  if (areaName === "local" && newValue?.active) {
+    maybeStartBulkRun();
+  }
+});
+
+maybeStartBulkRun();
 
 console.log("[auto-apply-jobs] linkedin content script loaded");

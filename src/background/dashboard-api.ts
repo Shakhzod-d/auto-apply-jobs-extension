@@ -4,6 +4,8 @@ import type {
   ApplicationStatus,
   FieldType,
   Platform,
+  Settings,
+  SubmitMode,
   SyncPayload,
 } from "../lib/types";
 
@@ -53,6 +55,16 @@ export function updateApplicationStatus(
   data: { status: ApplicationStatus; failureReason?: string; submittedAt?: string },
 ): Promise<{ application: Application }> {
   return request(config, `/api/applications/${applicationId}`, {
+    method: "PATCH",
+    body: JSON.stringify(data),
+  });
+}
+
+export function updateSettingsRemote(
+  config: DashboardConfig,
+  data: { submitMode?: SubmitMode; linkedinEnabled?: boolean; indeedEnabled?: boolean },
+): Promise<{ settings: Settings }> {
+  return request(config, "/api/settings", {
     method: "PATCH",
     body: JSON.stringify(data),
   });

@@ -48,13 +48,21 @@ export interface Settings {
   maxDelaySeconds: number;
   linkedinEnabled: boolean;
   indeedEnabled: boolean;
+  searchKeywords: string;
   updatedAt: string;
+}
+
+export interface SyncStats {
+  appliedToday: number;
+  linkedinAppliedToday: number;
+  indeedAppliedToday: number;
 }
 
 export interface SyncPayload {
   profile: Profile;
   questionBank: QuestionBankEntry[];
   settings: Settings;
+  stats: SyncStats;
 }
 
 export interface Application {

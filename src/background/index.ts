@@ -1,4 +1,5 @@
 import { getDashboardConfig } from "../lib/dashboard-config";
+import { getBulkRunState, newBulkRunState, setBulkRunState } from "../lib/bulk-run-state";
 import type { ExtensionMessage, ExtensionResponse, ConnectionStatus } from "../lib/messages";
 import type { SyncPayload } from "../lib/types";
 import {
@@ -6,7 +7,24 @@ import {
   reportApplication,
   reportPendingQuestion,
   updateApplicationStatus,
+  updateSettingsRemote,
 } from "./dashboard-api";
+
+const SEARCH_URLS = {
+  linkedin: (keywords: string) =>
+    `https://www.linkedin.com/jobs/search/?${new URLSearchParams({ keywords, f_AL: "true" }).toString()}`,
+  indeed: (keywords: string) =>
+    `https://www.indeed.com/jobs?${new URLSearchParams({ q: keywords }).toString()}`,
+} as const;
+
+async function openOrNavigateTab(url: string, hostMatch: string): Promise<void> {
+  const tabs = await chrome.tabs.query({ url: `*://*.${hostMatch}/*` });
+  if (tabs[0]?.id) {
+    await chrome.tabs.update(tabs[0].id, { url, active: true });
+  } else {
+    await chrome.tabs.create({ url, active: true });
+  }
+}
 
 const SYNC_ALARM = "periodic-sync";
 const SYNC_CACHE_KEY = "syncCache";
@@ -115,6 +133,44 @@ async function handleMessage(
         });
 
         return { ok: true, data: null };
+      }
+
+      case "START_BULK_APPLY": {
+        const config = await getDashboardConfig();
+        if (!config) throw new Error("Not connected to a dashboard");
+
+        const sync = await refreshSync(true);
+        if (!sync.settings.searchKeywords.trim()) {
+          throw new Error("Set job search keywords on the dashboard's Settings page first");
+        }
+
+        const buildUrl = SEARCH_URLS[message.platform];
+        const host = message.platform === "linkedin" ? "linkedin.com" : "indeed.com";
+        await openOrNavigateTab(buildUrl(sync.settings.searchKeywords), host);
+        await setBulkRunState(newBulkRunState(message.platform));
+
+        return { ok: true, data: null };
+      }
+
+      case "STOP_BULK_APPLY": {
+        const current = await getBulkRunState();
+        if (current) {
+          await setBulkRunState({ ...current, active: false, lastMessage: "Stopped by user" });
+        }
+        return { ok: true, data: null };
+      }
+
+      case "GET_BULK_RUN_STATE": {
+        const state = await getBulkRunState();
+        return { ok: true, data: state };
+      }
+
+      case "UPDATE_SETTINGS": {
+        const config = await getDashboardConfig();
+        if (!config) throw new Error("Not connected to a dashboard");
+        await updateSettingsRemote(config, { submitMode: message.submitMode });
+        const data = await refreshSync(true);
+        return { ok: true, data };
       }
 
       default: {
