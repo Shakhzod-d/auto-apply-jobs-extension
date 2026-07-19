@@ -141,7 +141,24 @@ export function Popup() {
         )}
       </div>
 
-      <div style={{ fontSize: 11, color: "#999" }}>Connected to {status.dashboardUrl}</div>
+      <div
+        style={{
+          fontSize: 11,
+          color: "#999",
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+        }}
+      >
+        <span>Connected to {status.dashboardUrl}</span>
+        <button
+          type="button"
+          onClick={() => chrome.runtime.openOptionsPage()}
+          style={{ border: "none", background: "none", color: "#666", cursor: "pointer", fontSize: 11, textDecoration: "underline" }}
+        >
+          Manage
+        </button>
+      </div>
     </div>
   );
 }

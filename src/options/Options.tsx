@@ -82,7 +82,9 @@ export function Options() {
       <h1 style={{ fontSize: 18, fontWeight: 600 }}>Auto Apply Jobs — Settings</h1>
       <p style={{ color: "#666", fontSize: 14 }}>
         Connect this extension to your dashboard. Find your dashboard URL and
-        API token on the dashboard&apos;s own Settings page.
+        API token on the dashboard&apos;s own Settings page. Already
+        connected? Edit the fields below and click Connect again any time to
+        update them — you don&apos;t need to disconnect first.
       </p>
 
       <form onSubmit={handleConnect} style={{ display: "flex", flexDirection: "column", gap: 12, marginTop: 16 }}>
@@ -137,6 +139,14 @@ export function Options() {
         )}
         {status.kind === "error" && <div style={{ color: "#c0392b" }}>{status.message}</div>}
       </div>
+
+      <p style={{ marginTop: 24, fontSize: 12, color: "#999" }}>
+        This is saved in the extension&apos;s own storage and survives code
+        updates. When updating the extension after a rebuild, use the small
+        reload icon on its card in <code>chrome://extensions</code> — using
+        &quot;Remove&quot; and then &quot;Load unpacked&quot; again wipes this
+        and everything else the extension has stored, requiring reconnection.
+      </p>
     </div>
   );
 }
