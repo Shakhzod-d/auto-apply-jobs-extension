@@ -245,7 +245,7 @@ async function failApplication(
 // defeat the purpose. That application stays `blocked_needs_answer` for a
 // human (or a future resume pass) to pick up later.
 async function runEasyApplyFlow(
-  modal: Element,
+  initialModal: Element,
   application: Application,
   sync: SyncPayload,
   interactive: boolean,
@@ -253,6 +253,16 @@ async function runEasyApplyFlow(
   const MAX_STEPS = 25;
 
   for (let step = 0; step < MAX_STEPS; step++) {
+    // Re-query fresh every step rather than reusing `initialModal` -- LinkedIn's
+    // Ember app can recreate the modal's DOM subtree between steps (observed
+    // with third-party-ATS-embedded flows in particular), which would
+    // silently detach a cached reference from the live document. Every
+    // subsequent querySelector on a detached node finds nothing, so
+    // findStageButton() below would report "no button found" on essentially
+    // every step past the first -- this was a real, confirmed bug (a live
+    // bulk run reported 284 processed / 0 submitted / 284 failed).
+    const modal = document.querySelector(SELECTORS.modal) ?? initialModal;
+
     await handleResumeStep(modal, sync.profile.resumeFileUrl);
 
     const fields = extractFieldsFromCurrentStep(modal);
@@ -282,7 +292,7 @@ async function runEasyApplyFlow(
     if (!button) {
       return failApplication(
         application,
-        "Could not find a Next/Review/Submit button on the current step",
+        `Could not find a Next/Review/Submit button on step ${step + 1}`,
         modal,
       );
     }
@@ -313,7 +323,7 @@ async function runEasyApplyFlow(
   return failApplication(
     application,
     `Exceeded ${MAX_STEPS} steps without reaching submit -- form is probably longer/different than expected`,
-    modal,
+    document.querySelector(SELECTORS.modal) ?? initialModal,
   );
 }
 
