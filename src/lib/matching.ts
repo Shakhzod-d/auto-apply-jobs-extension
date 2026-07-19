@@ -47,10 +47,24 @@ export function matchQuestion(
   return best;
 }
 
-export type IdentityFieldKey = "fullName" | "email" | "phone" | "linkedinUrl" | "portfolioUrl";
+export type IdentityFieldKey =
+  | "fullName"
+  | "firstName"
+  | "lastName"
+  | "email"
+  | "phone"
+  | "linkedinUrl"
+  | "portfolioUrl";
 
 const IDENTITY_PATTERNS: { key: IdentityFieldKey; keywords: string[] }[] = [
+  // Longer/more specific patterns must come before shorter ones sharing a
+  // keyword ("first name" before a bare "name"), since the first hit wins.
+  { key: "firstName", keywords: ["first", "name"] },
+  { key: "lastName", keywords: ["last", "name"] },
+  { key: "lastName", keywords: ["surname"] },
+  { key: "lastName", keywords: ["family", "name"] },
   { key: "fullName", keywords: ["full", "name"] },
+  { key: "fullName", keywords: ["name"] },
   { key: "email", keywords: ["email"] },
   { key: "email", keywords: ["e", "mail"] },
   { key: "phone", keywords: ["phone"] },
@@ -61,6 +75,19 @@ const IDENTITY_PATTERNS: { key: IdentityFieldKey; keywords: string[] }[] = [
   { key: "portfolioUrl", keywords: ["website"] },
   { key: "portfolioUrl", keywords: ["personal", "site"] },
 ];
+
+// LinkedIn/Indeed often ask for first/last name as separate fields, but
+// Profile only stores a single fullName -- split on whitespace, taking the
+// last token as the surname (handles most Western name orderings; not
+// perfect for all naming conventions, but a reasonable default that the
+// pending-question flow can still override per-question if it guesses
+// wrong).
+function splitName(fullName: string): { first: string; last: string } {
+  const parts = fullName.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return { first: "", last: "" };
+  if (parts.length === 1) return { first: parts[0], last: "" };
+  return { first: parts[0], last: parts[parts.length - 1] };
+}
 
 // Identity fields (name/email/phone/links) come straight from Profile, not
 // the question bank -- checked before matchQuestion so e.g. "Email" doesn't
@@ -74,6 +101,10 @@ export function matchIdentityField(label: string, profile: Profile): string | nu
     if (!hit) continue;
 
     switch (pattern.key) {
+      case "firstName":
+        return splitName(profile.fullName).first || null;
+      case "lastName":
+        return splitName(profile.fullName).last || null;
       case "fullName":
         return profile.fullName || null;
       case "email":
