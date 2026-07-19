@@ -316,40 +316,73 @@ function waitForNextModalResult(): Promise<FlowResult> {
   });
 }
 
+// Captured by the bulk driver right before it clicks Easy Apply (while the
+// details pane -- not yet a modal -- is guaranteed queryable), used as a
+// fallback below in case the modal covers/removes the underlying pane's
+// title/company elements by the time this async handler actually runs.
+let pendingJobInfo: { jobTitle: string; company: string; url: string } | null = null;
+
+// Every exit path below MUST resolve `resolveBulk` if it was set -- the
+// bulk-driver bug that shipped first (loop just hangs, "0 processed"
+// forever) was this function returning early without doing so, e.g. when
+// getCurrentJobInfo() came back null. A safety timeout in the driver covers
+// us even if a future change misses a path, but that's a 90s stall per
+// miss, not a fix.
 async function onEasyApplyModalOpened(modal: Element) {
-  const jobInfo = getCurrentJobInfo();
-  if (!jobInfo) return;
-
-  const syncRes = await sendMessage<SyncPayload>({ type: "GET_SYNC_DATA" });
-  if (!syncRes.ok) return;
-  const sync = syncRes.data;
-
-  if (!sync.settings.linkedinEnabled) return;
-
-  const appRes = await sendMessage<Application>({
-    type: "REPORT_APPLICATION",
-    platform: "linkedin",
-    jobTitle: jobInfo.jobTitle,
-    company: jobInfo.company,
-    url: jobInfo.url,
-  });
-  if (!appRes.ok) return;
-  const application = appRes.data;
-
-  // Already handled before (submitted, or already sitting in the pending
-  // queue from a previous pass) -- don't reprocess.
-  if (application.status === "submitted" || application.status === "blocked_needs_answer") {
-    pendingBulkResolve?.("blocked");
-    pendingBulkResolve = null;
-    return;
-  }
-
   const resolveBulk = pendingBulkResolve;
   pendingBulkResolve = null;
   const interactive = !resolveBulk;
+  const fallbackJobInfo = pendingJobInfo;
+  pendingJobInfo = null;
 
-  const result = await runEasyApplyFlow(modal, application, sync, interactive);
-  resolveBulk?.(result);
+  try {
+    const jobInfo = getCurrentJobInfo() ?? fallbackJobInfo;
+    if (!jobInfo) {
+      log("could not determine job info for the open modal");
+      resolveBulk?.("failed");
+      return;
+    }
+
+    const syncRes = await sendMessage<SyncPayload>({ type: "GET_SYNC_DATA" });
+    if (!syncRes.ok) {
+      log("sync failed while handling modal:", syncRes.error);
+      resolveBulk?.("failed");
+      return;
+    }
+    const sync = syncRes.data;
+
+    if (!sync.settings.linkedinEnabled) {
+      resolveBulk?.("failed");
+      return;
+    }
+
+    const appRes = await sendMessage<Application>({
+      type: "REPORT_APPLICATION",
+      platform: "linkedin",
+      jobTitle: jobInfo.jobTitle,
+      company: jobInfo.company,
+      url: jobInfo.url,
+    });
+    if (!appRes.ok) {
+      log("failed to report application:", appRes.error);
+      resolveBulk?.("failed");
+      return;
+    }
+    const application = appRes.data;
+
+    // Already handled before (submitted, or already sitting in the pending
+    // queue from a previous pass) -- don't reprocess.
+    if (application.status === "submitted" || application.status === "blocked_needs_answer") {
+      resolveBulk?.("blocked");
+      return;
+    }
+
+    const result = await runEasyApplyFlow(modal, application, sync, interactive);
+    resolveBulk?.(result);
+  } catch (err) {
+    log("onEasyApplyModalOpened threw:", err);
+    resolveBulk?.("failed");
+  }
 }
 
 const seenModals = new WeakSet<Element>();
@@ -396,96 +429,115 @@ async function goToNextPage(): Promise<boolean> {
   return true;
 }
 
+const log = (...args: unknown[]) => console.log("[auto-apply-jobs]", ...args);
+
+async function reportStatus(message: string) {
+  log(message);
+  const current = await getBulkRunState();
+  if (current) await setBulkRunState({ ...current, lastMessage: message, lastActivityAt: Date.now() });
+}
+
+async function stopBulkRun(reason: string) {
+  log("stopping:", reason);
+  const current = await getBulkRunState();
+  if (current) await setBulkRunState({ ...current, active: false, lastMessage: reason });
+}
+
 async function bulkApplyLoop() {
   const processedJobIds = new Set<string>();
+  log("bulk apply loop started");
 
   while (true) {
-    const bulkRun = await getBulkRunState();
-    if (!bulkRun?.active || bulkRun.platform !== "linkedin") return;
-
-    const syncRes = await sendMessage<SyncPayload>({ type: "GET_SYNC_DATA", forceRefresh: true });
-    if (!syncRes.ok) {
-      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "Lost connection to dashboard" });
-      return;
-    }
-    const sync = syncRes.data;
-
-    if (!sync.settings.linkedinEnabled) {
-      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "LinkedIn disabled in Settings" });
-      return;
-    }
-    if (sync.stats.appliedToday >= sync.settings.dailyCap) {
-      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "Overall daily cap reached" });
-      return;
-    }
-    if (sync.stats.linkedinAppliedToday >= sync.settings.linkedinDailyCap) {
-      await setBulkRunState({ ...bulkRun, active: false, lastMessage: "LinkedIn daily cap reached" });
-      return;
-    }
-
-    await waitFor(() => getJobCards().length > 0);
-    const cards = getJobCards();
-    const next = cards.find((card) => {
-      const jobId = cardJobId(card);
-      return jobId && !processedJobIds.has(jobId) && cardIsEasyApply(card) && !cardAlreadyApplied(card);
-    });
-
-    if (!next) {
-      const advanced = await goToNextPage();
-      if (!advanced) {
-        await setBulkRunState({ ...bulkRun, active: false, lastMessage: "No more results" });
+    try {
+      const bulkRun = await getBulkRunState();
+      if (!bulkRun?.active || bulkRun.platform !== "linkedin") {
+        log("loop exiting: run no longer active");
         return;
       }
+
+      const syncRes = await sendMessage<SyncPayload>({ type: "GET_SYNC_DATA", forceRefresh: true });
+      if (!syncRes.ok) return stopBulkRun("Lost connection to dashboard: " + syncRes.error);
+      const sync = syncRes.data;
+
+      if (!sync.settings.linkedinEnabled) return stopBulkRun("LinkedIn disabled in Settings");
+      if (sync.stats.appliedToday >= sync.settings.dailyCap) return stopBulkRun("Overall daily cap reached");
+      if (sync.stats.linkedinAppliedToday >= sync.settings.linkedinDailyCap) {
+        return stopBulkRun("LinkedIn daily cap reached");
+      }
+
+      await reportStatus("Looking for the next job…");
       await waitFor(() => getJobCards().length > 0);
-      continue;
-    }
-
-    const jobId = cardJobId(next)!;
-    processedJobIds.add(jobId);
-
-    next.scrollIntoView({ block: "center" });
-    await clickAndWait(next, 300);
-
-    const applyButtonSelector = '.jobs-apply-button[data-live-test-job-apply-button], .jobs-apply-button';
-    const appeared = await waitFor(() => !!document.querySelector(applyButtonSelector));
-    if (!appeared) {
-      continue; // details pane never showed an apply button in time -- skip this one
-    }
-    const applyButton = document.querySelector<HTMLElement>(applyButtonSelector)!;
-
-    const resultPromise = waitForNextModalResult();
-    applyButton.click();
-
-    const result = await Promise.race([
-      resultPromise,
-      sleep(3 * 60_000).then((): FlowResult => "failed"), // safety timeout per job
-    ]);
-
-    const updated = await getBulkRunState();
-    if (!updated) return;
-    await setBulkRunState({
-      ...updated,
-      processedCount: updated.processedCount + 1,
-      submittedCount: updated.submittedCount + (result === "submitted" ? 1 : 0),
-      pendingReviewCount: updated.pendingReviewCount + (result === "pending_review" ? 1 : 0),
-      blockedCount: updated.blockedCount + (result === "blocked" ? 1 : 0),
-      failedCount: updated.failedCount + (result === "failed" ? 1 : 0),
-      lastActivityAt: Date.now(),
-    });
-
-    // In review mode, a submitted-for-review application leaves the modal
-    // open for the user -- stop the automated loop rather than barreling
-    // into the next job out from under them.
-    if (result === "pending_review") {
-      await setBulkRunState({
-        ...(await getBulkRunState())!,
-        active: false,
-        lastMessage: "Filled and waiting for your review",
+      const cards = getJobCards();
+      const next = cards.find((card) => {
+        const jobId = cardJobId(card);
+        return jobId && !processedJobIds.has(jobId) && cardIsEasyApply(card) && !cardAlreadyApplied(card);
       });
+
+      if (!next) {
+        await reportStatus("No more unapplied jobs on this page, trying next page…");
+        const advanced = await goToNextPage();
+        if (!advanced) return stopBulkRun("No more results");
+        await waitFor(() => getJobCards().length > 0);
+        continue;
+      }
+
+      const jobId = cardJobId(next)!;
+      processedJobIds.add(jobId);
+      const cardTitle = next.querySelector('a[href*="/jobs/view/"]')?.textContent?.trim() ?? jobId;
+
+      await reportStatus(`Opening: ${cardTitle}`);
+      next.scrollIntoView({ block: "center" });
+      await clickAndWait(next, 300);
+
+      const applyButtonSelector = '.jobs-apply-button[data-live-test-job-apply-button], .jobs-apply-button';
+      const appeared = await waitFor(() => !!document.querySelector(applyButtonSelector));
+      if (!appeared) {
+        log("no Easy Apply button appeared for", cardTitle, "-- skipping");
+        continue;
+      }
+      const applyButton = document.querySelector<HTMLElement>(applyButtonSelector)!;
+
+      await reportStatus(`Applying: ${cardTitle}`);
+      pendingJobInfo = getCurrentJobInfo(); // captured pre-modal, while reliably queryable
+      const resultPromise = waitForNextModalResult();
+      applyButton.click();
+
+      const result = await Promise.race([
+        resultPromise,
+        sleep(90_000).then((): FlowResult => {
+          log("timed out waiting for modal flow to finish for", cardTitle);
+          return "failed";
+        }),
+      ]);
+      log("result for", cardTitle, "=", result);
+
+      const updated = await getBulkRunState();
+      if (!updated) return;
+      await setBulkRunState({
+        ...updated,
+        processedCount: updated.processedCount + 1,
+        submittedCount: updated.submittedCount + (result === "submitted" ? 1 : 0),
+        pendingReviewCount: updated.pendingReviewCount + (result === "pending_review" ? 1 : 0),
+        blockedCount: updated.blockedCount + (result === "blocked" ? 1 : 0),
+        failedCount: updated.failedCount + (result === "failed" ? 1 : 0),
+        lastActivityAt: Date.now(),
+        lastMessage: `${cardTitle}: ${result}`,
+      });
+
+      // In review mode, a submitted-for-review application leaves the modal
+      // open for the user -- stop the automated loop rather than barreling
+      // into the next job out from under them.
+      if (result === "pending_review") {
+        return stopBulkRun("Filled and waiting for your review");
+      }
+
+      await sleep(randomDelayMs(sync.settings.minDelaySeconds, sync.settings.maxDelaySeconds));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("[auto-apply-jobs] bulk apply loop error", err);
+      await stopBulkRun("Stopped on error: " + message);
       return;
     }
-
-    await sleep(randomDelayMs(sync.settings.minDelaySeconds, sync.settings.maxDelaySeconds));
   }
 }
 
