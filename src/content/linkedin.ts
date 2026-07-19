@@ -15,8 +15,8 @@ import {
   type ExtractedField,
 } from "../lib/autofill-engine";
 import { fillFileInput, labelTextFor } from "../lib/dom-fill";
-import { sendMessage } from "../lib/messages";
-import type { Application, FieldType, SyncPayload } from "../lib/types";
+import { sendMessage, type ExtensionMessage } from "../lib/messages";
+import type { Application, FieldType, FlowResult, SyncPayload } from "../lib/types";
 import {
   getBulkRunState,
   setBulkRunState,
@@ -171,6 +171,21 @@ async function handleResumeStep(modal: Element, resumeFileUrl: string | null): P
   await fillFileInput(fileInput, resumeFileUrl, "resume.pdf");
 }
 
+// LinkedIn's Easy Apply button and its plain external "Apply" button (for
+// jobs "managed off LinkedIn") share the exact same class and
+// data-live-test-job-apply-button attribute -- the only difference is the
+// text/aria-label ("Easy Apply to X" vs "Apply to X on company website").
+// Getting this wrong means clicking Apply and then waiting on a modal that
+// will never open.
+function detectApplyButton(): { kind: "easy_apply" | "external"; el: HTMLElement } | null {
+  const el = document.querySelector<HTMLElement>(
+    '.jobs-apply-button[data-live-test-job-apply-button], .jobs-apply-button',
+  );
+  if (!el) return null;
+  const label = `${el.getAttribute("aria-label") ?? ""} ${el.textContent ?? ""}`;
+  return { kind: /easy apply/i.test(label) ? "easy_apply" : "external", el };
+}
+
 function findStageButton(
   modal: Element,
 ): { kind: "next" | "review" | "submit"; el: HTMLElement } | null {
@@ -205,8 +220,6 @@ async function reportUnmatchedField(
     options,
   });
 }
-
-type FlowResult = "submitted" | "pending_review" | "blocked" | "failed";
 
 async function failApplication(
   application: Application,
@@ -316,6 +329,24 @@ function waitForNextModalResult(): Promise<FlowResult> {
   });
 }
 
+// Mirrors pendingBulkResolve, but for a job whose "Apply" button opens an
+// off-platform ATS page in a new tab rather than a same-page modal --
+// background relays that tab's result back here via EXTERNAL_APPLY_DONE.
+let pendingExternalResolve: ((result: FlowResult) => void) | null = null;
+
+function waitForExternalApplyResult(): Promise<FlowResult> {
+  return new Promise((resolve) => {
+    pendingExternalResolve = resolve;
+  });
+}
+
+chrome.runtime.onMessage.addListener((message: ExtensionMessage) => {
+  if (message.type === "EXTERNAL_APPLY_DONE") {
+    pendingExternalResolve?.(message.result);
+    pendingExternalResolve = null;
+  }
+});
+
 // Captured by the bulk driver right before it clicks Easy Apply (while the
 // details pane -- not yet a modal -- is guaranteed queryable), used as a
 // fallback below in case the modal covers/removes the underlying pane's
@@ -414,10 +445,6 @@ function cardJobId(card: HTMLElement): string | null {
   return card.querySelector("[data-job-id]")?.getAttribute("data-job-id") ?? null;
 }
 
-function cardIsEasyApply(card: HTMLElement): boolean {
-  return /Easy Apply/i.test(card.textContent ?? "");
-}
-
 function cardAlreadyApplied(card: HTMLElement): boolean {
   return /\bApplied\b/.test(card.textContent ?? "");
 }
@@ -468,9 +495,12 @@ async function bulkApplyLoop() {
       await reportStatus("Looking for the next job…");
       await waitFor(() => getJobCards().length > 0);
       const cards = getJobCards();
+      // Any not-yet-processed, not-already-applied card -- Easy Apply and
+      // "managed off LinkedIn" external jobs both get worked, per the
+      // decision to cover all application types, not just Easy Apply.
       const next = cards.find((card) => {
         const jobId = cardJobId(card);
-        return jobId && !processedJobIds.has(jobId) && cardIsEasyApply(card) && !cardAlreadyApplied(card);
+        return jobId && !processedJobIds.has(jobId) && !cardAlreadyApplied(card);
       });
 
       if (!next) {
@@ -489,26 +519,46 @@ async function bulkApplyLoop() {
       next.scrollIntoView({ block: "center" });
       await clickAndWait(next, 300);
 
-      const applyButtonSelector = '.jobs-apply-button[data-live-test-job-apply-button], .jobs-apply-button';
-      const appeared = await waitFor(() => !!document.querySelector(applyButtonSelector));
+      const appeared = await waitFor(() => !!detectApplyButton());
       if (!appeared) {
-        log("no Easy Apply button appeared for", cardTitle, "-- skipping");
+        log("no apply button appeared for", cardTitle, "-- skipping");
         continue;
       }
-      const applyButton = document.querySelector<HTMLElement>(applyButtonSelector)!;
+      const button = detectApplyButton()!;
 
-      await reportStatus(`Applying: ${cardTitle}`);
-      pendingJobInfo = getCurrentJobInfo(); // captured pre-modal, while reliably queryable
-      const resultPromise = waitForNextModalResult();
-      applyButton.click();
-
-      const result = await Promise.race([
-        resultPromise,
-        sleep(90_000).then((): FlowResult => {
-          log("timed out waiting for modal flow to finish for", cardTitle);
-          return "failed";
-        }),
-      ]);
+      let result: FlowResult;
+      if (button.kind === "easy_apply") {
+        await reportStatus(`Applying: ${cardTitle}`);
+        pendingJobInfo = getCurrentJobInfo(); // captured pre-modal, while reliably queryable
+        const resultPromise = waitForNextModalResult();
+        button.el.click();
+        result = await Promise.race([
+          resultPromise,
+          sleep(90_000).then((): FlowResult => {
+            log("timed out waiting for modal flow to finish for", cardTitle);
+            return "failed";
+          }),
+        ]);
+      } else {
+        // Opens the employer's own application page in a new tab (LinkedIn's
+        // standard behavior for jobs "managed off LinkedIn"). background.ts
+        // detects that tab via chrome.tabs.onCreated (matched to this tab as
+        // opener) and arms external-apply.ts on it once loaded.
+        await reportStatus(`Applying (external): ${cardTitle}`);
+        const jobInfo = getCurrentJobInfo();
+        if (jobInfo) {
+          await sendMessage({ type: "PREPARE_EXTERNAL_APPLY", ...jobInfo });
+        }
+        const resultPromise = waitForExternalApplyResult();
+        button.el.click();
+        result = await Promise.race([
+          resultPromise,
+          sleep(120_000).then((): FlowResult => {
+            log("timed out waiting for external-apply tab to finish for", cardTitle);
+            return "failed";
+          }),
+        ]);
+      }
       log("result for", cardTitle, "=", result);
 
       const updated = await getBulkRunState();
@@ -524,10 +574,13 @@ async function bulkApplyLoop() {
         lastMessage: `${cardTitle}: ${result}`,
       });
 
-      // In review mode, a submitted-for-review application leaves the modal
-      // open for the user -- stop the automated loop rather than barreling
-      // into the next job out from under them.
-      if (result === "pending_review") {
+      // Easy Apply's "pending review" happens in *this* tab's modal, left
+      // open on purpose -- stop the loop rather than barreling into the next
+      // job out from under the user. External-apply's "pending review"
+      // happens in a *separate* tab that just sits there waiting, so it
+      // does not need to block the loop -- those tabs accumulate for the
+      // user to review at their own pace while the run keeps going.
+      if (button.kind === "easy_apply" && result === "pending_review") {
         return stopBulkRun("Filled and waiting for your review");
       }
 

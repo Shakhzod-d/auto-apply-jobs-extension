@@ -17,13 +17,14 @@ const SEARCH_URLS = {
     `https://www.indeed.com/jobs?${new URLSearchParams({ q: keywords }).toString()}`,
 } as const;
 
-async function openOrNavigateTab(url: string, hostMatch: string): Promise<void> {
+async function openOrNavigateTab(url: string, hostMatch: string): Promise<number> {
   const tabs = await chrome.tabs.query({ url: `*://*.${hostMatch}/*` });
   if (tabs[0]?.id) {
     await chrome.tabs.update(tabs[0].id, { url, active: true });
-  } else {
-    await chrome.tabs.create({ url, active: true });
+    return tabs[0].id;
   }
+  const created = await chrome.tabs.create({ url, active: true });
+  return created.id!;
 }
 
 const SYNC_ALARM = "periodic-sync";
@@ -146,8 +147,8 @@ async function handleMessage(
 
         const buildUrl = SEARCH_URLS[message.platform];
         const host = message.platform === "linkedin" ? "linkedin.com" : "indeed.com";
-        await openOrNavigateTab(buildUrl(sync.settings.searchKeywords), host);
-        await setBulkRunState(newBulkRunState(message.platform));
+        const driverTabId = await openOrNavigateTab(buildUrl(sync.settings.searchKeywords), host);
+        await setBulkRunState({ ...newBulkRunState(message.platform), driverTabId });
 
         return { ok: true, data: null };
       }
@@ -173,6 +174,39 @@ async function handleMessage(
         return { ok: true, data };
       }
 
+      case "PREPARE_EXTERNAL_APPLY": {
+        const current = await getBulkRunState();
+        if (current) {
+          await setBulkRunState({
+            ...current,
+            pendingExternalJobInfo: {
+              jobTitle: message.jobTitle,
+              company: message.company,
+              url: message.url,
+            },
+          });
+        }
+        return { ok: true, data: null };
+      }
+
+      case "REPORT_EXTERNAL_APPLY_RESULT": {
+        const current = await getBulkRunState();
+        if (current?.driverTabId) {
+          chrome.tabs.sendMessage(current.driverTabId, {
+            type: "EXTERNAL_APPLY_DONE",
+            result: message.result,
+          });
+        }
+        return { ok: true, data: null };
+      }
+
+      // Sent by background *to* a content script via chrome.tabs.sendMessage,
+      // not something background itself should ever receive -- these two
+      // cases exist only so the switch stays exhaustive.
+      case "ARM_EXTERNAL_APPLY":
+      case "EXTERNAL_APPLY_DONE":
+        return { ok: true, data: null };
+
       default: {
         const _exhaustive: never = message;
         throw new Error(`Unknown message type: ${JSON.stringify(_exhaustive)}`);
@@ -186,6 +220,39 @@ async function handleMessage(
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
   handleMessage(message).then(sendResponse);
   return true; // keep the message channel open for the async response
+});
+
+// A LinkedIn "Apply" (non-Easy-Apply) button opens the employer's own
+// application page in a new tab. We can't know that domain ahead of time,
+// so instead of a static content_scripts match we watch for a tab opened by
+// our own driver tab and arm external-apply.ts (already present on the page
+// via the <all_urls> content script, but passive until told) once it's
+// loaded.
+chrome.tabs.onCreated.addListener(async (tab) => {
+  if (!tab.id || !tab.openerTabId) return;
+  const bulkRun = await getBulkRunState();
+  if (!bulkRun?.active || bulkRun.driverTabId !== tab.openerTabId) return;
+  await setBulkRunState({ ...bulkRun, pendingExternalTabId: tab.id });
+});
+
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.status !== "complete") return;
+  const bulkRun = await getBulkRunState();
+  if (!bulkRun?.active || bulkRun.pendingExternalTabId !== tabId) return;
+
+  const jobInfo = bulkRun.pendingExternalJobInfo;
+  await setBulkRunState({ ...bulkRun, pendingExternalTabId: undefined, pendingExternalJobInfo: undefined });
+  if (!jobInfo) return;
+
+  chrome.tabs.sendMessage(tabId, {
+    type: "ARM_EXTERNAL_APPLY",
+    jobTitle: jobInfo.jobTitle,
+    company: jobInfo.company,
+  }).catch(() => {
+    // The tab may not have a content script ready yet on the very first
+    // update event (e.g. about:blank before the real navigation) -- a
+    // later "complete" event for the same tab will retry.
+  });
 });
 
 chrome.runtime.onInstalled.addListener(() => {

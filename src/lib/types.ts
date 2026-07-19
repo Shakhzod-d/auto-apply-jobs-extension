@@ -77,3 +77,7 @@ export interface Application {
   updatedAt: string;
   submittedAt: string | null;
 }
+
+// Outcome of one application attempt, whether it ran inside a LinkedIn Easy
+// Apply modal or on an off-platform ATS page opened via external-apply.
+export type FlowResult = "submitted" | "pending_review" | "blocked" | "failed";

@@ -48,6 +48,10 @@ export function Popup() {
 
   async function startBulkApply() {
     setBusy(true);
+    // Needed so external-apply.ts is allowed to run on whatever off-platform
+    // ATS domain a "managed off LinkedIn" job happens to redirect to --
+    // requested here (not up front) since it must follow a user gesture.
+    await chrome.permissions.request({ origins: ["*://*/*"] });
     await sendMessage({ type: "START_BULK_APPLY", platform: "linkedin" });
     await refresh();
     setBusy(false);

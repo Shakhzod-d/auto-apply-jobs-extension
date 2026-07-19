@@ -5,7 +5,7 @@ export default defineManifest({
   manifest_version: 3,
   name: "Auto Apply Jobs",
   description:
-    "Autofills and (optionally) submits job applications on LinkedIn and Indeed, syncing every application to your admin dashboard.",
+    "Autofills and (optionally) submits LinkedIn job applications -- Easy Apply and off-platform ATS pages alike -- syncing every application to your admin dashboard.",
   version: pkg.version,
   icons: {
     16: "public/icon16.png",
@@ -34,19 +34,29 @@ export default defineManifest({
       run_at: "document_idle",
     },
     {
-      matches: ["https://www.indeed.com/*"],
-      js: ["src/content/indeed.ts"],
+      // Off-platform ATS pages a LinkedIn "Apply" button opens aren't a
+      // known domain ahead of time, so this matches everywhere -- but Chrome
+      // only actually injects it on origins the extension currently has
+      // host permission for, which starts as none (see
+      // optional_host_permissions below) and is granted only when the user
+      // clicks "Start applying". The script itself additionally stays
+      // completely passive until the background sends it a targeted
+      // ARM_EXTERNAL_APPLY message for that exact tab, so it never runs on
+      // a page the user just happens to be browsing.
+      matches: ["<all_urls>"],
+      js: ["src/content/external-apply.ts"],
       run_at: "document_idle",
     },
   ],
-  permissions: ["storage", "notifications", "alarms"],
-  host_permissions: [
-    "https://www.linkedin.com/*",
-    "https://www.indeed.com/*",
-  ],
-  // The dashboard runs at a user-configured URL (localhost while developing,
-  // a Vercel domain once deployed). We request just that origin at runtime
-  // via chrome.permissions.request() when the user saves it in Options,
-  // rather than declaring a fixed/broad host permission up front.
+  // "tabs" lets the background worker reliably notice the new tab a
+  // LinkedIn "Apply" click opens and read its load-completion status.
+  permissions: ["storage", "notifications", "alarms", "tabs"],
+  host_permissions: ["https://www.linkedin.com/*"],
+  // Two different runtime-requested grants, both via chrome.permissions.request():
+  // (1) the dashboard's own origin (requested when the user saves it in
+  //     Options) so the background worker can call its /api/*.
+  // (2) all-sites access (requested when the user clicks "Start applying",
+  //     a user gesture) so external-apply.ts is allowed to run on whatever
+  //     off-platform ATS domain a job happens to redirect to.
   optional_host_permissions: ["*://*/*"],
 });

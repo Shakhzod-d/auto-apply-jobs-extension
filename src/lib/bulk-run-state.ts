@@ -11,6 +11,12 @@ export interface BulkRunState {
   failedCount: number;
   lastActivityAt: number;
   lastMessage?: string;
+  /** Tab the driver loop runs in -- new tabs it opens are matched against this via openerTabId. */
+  driverTabId?: number;
+  /** Tab currently loading an off-platform ATS page, waiting to be armed once ready. */
+  pendingExternalTabId?: number;
+  /** Set by the driver just before clicking an external "Apply" button, since the new tab itself can't know this. */
+  pendingExternalJobInfo?: { jobTitle: string; company: string; url: string };
 }
 
 const STORAGE_KEY = "bulkRun";

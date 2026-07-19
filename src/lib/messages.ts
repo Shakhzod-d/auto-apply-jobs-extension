@@ -2,6 +2,7 @@ import type {
   Application,
   ApplicationStatus,
   FieldType,
+  FlowResult,
   Platform,
   SubmitMode,
   SyncPayload,
@@ -35,7 +36,18 @@ export type ExtensionMessage =
   | { type: "START_BULK_APPLY"; platform: Platform }
   | { type: "STOP_BULK_APPLY" }
   | { type: "GET_BULK_RUN_STATE" }
-  | { type: "UPDATE_SETTINGS"; submitMode?: SubmitMode };
+  | { type: "UPDATE_SETTINGS"; submitMode?: SubmitMode }
+  // Driver -> background, just before clicking an external "Apply" button --
+  // the new tab it opens has no way to know the job title/company itself.
+  | { type: "PREPARE_EXTERNAL_APPLY"; jobTitle: string; company: string; url: string }
+  // Background -> a specific off-platform ATS tab, via chrome.tabs.sendMessage:
+  // "you're the tab a LinkedIn Apply click opened, go ahead."
+  | { type: "ARM_EXTERNAL_APPLY"; jobTitle: string; company: string }
+  // That tab -> background, once it's done (via the normal
+  // chrome.runtime.sendMessage path), and background's relay of it back to
+  // the LinkedIn driver tab (via chrome.tabs.sendMessage).
+  | { type: "REPORT_EXTERNAL_APPLY_RESULT"; result: FlowResult }
+  | { type: "EXTERNAL_APPLY_DONE"; result: FlowResult };
 
 export type ExtensionResponse<T = unknown> =
   | { ok: true; data: T }
