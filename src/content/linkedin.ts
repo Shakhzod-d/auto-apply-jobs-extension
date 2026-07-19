@@ -40,6 +40,23 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// LinkedIn is a heavy Ember SPA -- after a navigation (or a card click that
+// swaps the details pane), the DOM the new view will render into exists
+// well before the actual content does. Polling instead of a fixed delay
+// avoids both "gave up too early" (the bug that shipped first) and paying a
+// worst-case delay on every single job when it usually loads fast.
+async function waitFor(
+  predicate: () => boolean,
+  { timeoutMs = 15_000, intervalMs = 400 } = {},
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await sleep(intervalMs);
+  }
+  return predicate();
+}
+
 function isEasyApplyModal(modal: Element): boolean {
   return (
     !!modal.querySelector(SELECTORS.formFieldWrapper) ||
@@ -406,6 +423,7 @@ async function bulkApplyLoop() {
       return;
     }
 
+    await waitFor(() => getJobCards().length > 0);
     const cards = getJobCards();
     const next = cards.find((card) => {
       const jobId = cardJobId(card);
@@ -418,6 +436,7 @@ async function bulkApplyLoop() {
         await setBulkRunState({ ...bulkRun, active: false, lastMessage: "No more results" });
         return;
       }
+      await waitFor(() => getJobCards().length > 0);
       continue;
     }
 
@@ -425,14 +444,14 @@ async function bulkApplyLoop() {
     processedJobIds.add(jobId);
 
     next.scrollIntoView({ block: "center" });
-    await clickAndWait(next, 1500);
+    await clickAndWait(next, 300);
 
-    const applyButton = document.querySelector<HTMLElement>(
-      '.jobs-apply-button[data-live-test-job-apply-button], .jobs-apply-button',
-    );
-    if (!applyButton) {
-      continue; // details pane didn't load an apply button in time -- skip this one
+    const applyButtonSelector = '.jobs-apply-button[data-live-test-job-apply-button], .jobs-apply-button';
+    const appeared = await waitFor(() => !!document.querySelector(applyButtonSelector));
+    if (!appeared) {
+      continue; // details pane never showed an apply button in time -- skip this one
     }
+    const applyButton = document.querySelector<HTMLElement>(applyButtonSelector)!;
 
     const resultPromise = waitForNextModalResult();
     applyButton.click();
